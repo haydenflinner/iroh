@@ -119,8 +119,7 @@ impl<T: FromStr + Display + Hash + Ord> TxtAttrs<T> {
     ) -> Result<Self, ParseError> {
         let mut attrs: BTreeMap<T, Vec<String>> = BTreeMap::new();
         for s in strings {
-            let mut parts = s.split('=');
-            let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+            let Some((key, value)) = s.split_once('=') else {
                 return Err(e!(ParseError::UnexpectedFormat { s }));
             };
             let attr = T::from_str(key).map_err(|_| {
