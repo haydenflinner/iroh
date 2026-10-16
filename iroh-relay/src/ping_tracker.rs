@@ -2,7 +2,12 @@ use n0_future::time::{self, Duration, Instant};
 use tracing::debug;
 
 /// Maximum time for a ping response in the relay protocol.
-const PING_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 90s, not the stock 5s: a backgrounded browser tab's timers are
+/// throttled to roughly once a minute, so it physically cannot pong
+/// inside the default window and the relay used to drop every parked
+/// visitor after ~20s.
+const PING_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Minimum timeout for an RTT-based health check ping.
 const MIN_HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);

@@ -124,9 +124,13 @@ pub(crate) const PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// 5-15s, during which no relay traffic flows. Once the interface recovers, the relay
 /// actor reconnects (DNS + TCP + TLS + WebSocket upgrade), which adds another 1-2s.
 ///
-/// Set to match the connection-level idle timeout (30s) so the relay path survives
-/// as long as the connection itself.
-pub(crate) const RELAY_PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// nina: 150s, not 30s — a backgrounded browser tab's timers throttle to
+/// ~once a minute, stalling the 5s path heartbeat; the path must outlive
+/// a missed beat or every parked tab loses its conn. Still short enough
+/// that a truly dead path is reaped in minutes, and it must stay under
+/// the endpoints' negotiated conn-level idle timeout (both raised to
+/// match — see literate-net bind_keyed / keeper main.rs).
+pub(crate) const RELAY_PATH_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(150);
 
 /// Maximum number of concurrent QUIC multipath paths per connection.
 ///
