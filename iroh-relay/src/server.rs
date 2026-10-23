@@ -489,6 +489,8 @@ impl TlsConfig {
 pub struct Limits {
     /// Rate limits for incoming traffic from a client connection.
     pub client_rx: Option<ClientRateLimit>,
+    /// Endpoint ids exempt from `client_rx` (e.g. a co-located server).
+    pub client_rx_exempt: Vec<iroh_base::PublicKey>,
     /// Rate limit for accepting new connections. Unlimited if not set.
     ///
     /// Not currently implemented, setting this has no effect.
@@ -741,6 +743,7 @@ impl Server {
                 if let Some(cfg) = relay_config.limits.client_rx {
                     builder = builder.client_rx_ratelimit(cfg);
                 }
+                builder = builder.client_rx_exempt(relay_config.limits.client_rx_exempt.clone());
                 let (http_addr, tls_config) = match relay_config.tls {
                     Some(tls_config) => {
                         let server_tls_config = match tls_config.cert {

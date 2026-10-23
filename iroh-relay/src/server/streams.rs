@@ -341,6 +341,10 @@ pub(crate) struct RateLimited<S> {
     /// Subscribe via [`RateLimited::limited_watcher`] to be notified about it, e.g. to
     /// inform the client that it is being throttled.
     limited_tx: watch::Sender<u64>,
+    /// Set once the connection's endpoint id turns out to be on the
+    /// exemption list (known only after the handshake, which already runs
+    /// through this wrapper). An exempt stream reads unlimited.
+    exempt: Arc<AtomicBool>,
     /// Watcher for the per-client rate limit, if set.
     ///
     /// If set by constructing via [`RateLimited::from_watcher`], we check for
@@ -495,6 +499,7 @@ impl<S> RateLimited<S> {
             bucket,
             bucket_refilled: None,
             limited_tx: watch::Sender::new(0),
+            exempt: Arc::new(AtomicBool::new(false)),
             rate_limit_watcher: Some(rate_limit_watcher),
             metrics,
         })
@@ -516,6 +521,7 @@ impl<S> RateLimited<S> {
             )?),
             bucket_refilled: None,
             limited_tx: watch::Sender::new(0),
+            exempt: Arc::new(AtomicBool::new(false)),
             rate_limit_watcher: None,
             metrics,
         })
@@ -528,9 +534,15 @@ impl<S> RateLimited<S> {
             bucket: None,
             bucket_refilled: None,
             limited_tx: watch::Sender::new(0),
+            exempt: Arc::new(AtomicBool::new(false)),
             rate_limit_watcher: None,
             metrics,
         }
+    }
+
+    /// A handle that exempts this stream from rate limiting when set.
+    pub(crate) fn exempt_flag(&self) -> Arc<AtomicBool> {
+        self.exempt.clone()
     }
 
     /// Returns a watcher that counts how often reads from this stream have been rate-limited.
@@ -587,6 +599,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for RateLimited<S> {
                 }
                 Err(err) => warn!(%err, "ignoring invalid live rate-limit update"),
             }
+        }
+
+        if this.exempt.load(std::sync::atomic::Ordering::Relaxed) {
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
 
         let Some(bucket) = &mut this.bucket else {
@@ -695,6 +711,40 @@ mod tests {
         println!("{actual_bytes_per_second}");
         assert_eq!(actual_bytes_per_second.round() as u32, bytes_per_second);
 
+        Ok(())
+    }
+
+    /// An exempt stream (a co-located server on the exemption list) reads at
+    /// full speed under a limit that would otherwise throttle it.
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn test_ratelimiter_exempt() -> Result {
+        let (read, mut write) = tokio::io::duplex(4096);
+        let send_total = 1024 * 1024;
+        let send_data = vec![7u8; send_total];
+        let mut rate_limited = RateLimited::new(read, 1000, 1000, Arc::new(Metrics::default()))?;
+        rate_limited
+            .exempt_flag()
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let before = time::Instant::now();
+        n0_future::future::try_zip(
+            async {
+                let mut remaining = send_total;
+                let mut buf = [0u8; 4096];
+                while remaining > 0 {
+                    remaining -= rate_limited.read(&mut buf).await?;
+                }
+                Ok(())
+            },
+            async {
+                write.write_all(&send_data).await?;
+                write.flush().await
+            },
+        )
+        .await
+        .anyerr()?;
+        // 1 MiB at 1000 B/s would take ~17 minutes of (paused) time.
+        assert!(time::Instant::now().duration_since(before) < time::Duration::from_secs(1));
         Ok(())
     }
 

@@ -523,6 +523,9 @@ struct Limits {
 struct PerClientRateLimitConfig {
     /// Rate limit configuration for the incoming data from the client.
     rx: Option<RateLimitConfig>,
+    /// Endpoint ids (hex/z32 public keys) exempt from `rx`.
+    #[serde(default)]
+    exempt: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -727,7 +730,7 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
     let limits = match cfg.limits {
         Some(ref limits) => {
             let client_rx = match &limits.client {
-                Some(PerClientRateLimitConfig { rx: Some(rx) }) => {
+                Some(PerClientRateLimitConfig { rx: Some(rx), .. }) => {
                     if rx.bytes_per_second.is_none() && rx.max_burst_bytes.is_some() {
                         bail_any!("bytes_per_seconds must be specified to enable the rate-limiter");
                     }
@@ -748,12 +751,24 @@ async fn build_relay_config(cfg: Config) -> Result<relay::ServerConfig> {
                         None => None,
                     }
                 }
-                Some(PerClientRateLimitConfig { rx: None }) | None => None,
+                Some(PerClientRateLimitConfig { rx: None, .. }) | None => None,
+            };
+            let client_rx_exempt = match &limits.client {
+                Some(c) => c
+                    .exempt
+                    .iter()
+                    .map(|s| {
+                        s.parse::<iroh_base::PublicKey>()
+                            .std_context("limits.client.exempt: not an endpoint id")
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => Vec::new(),
             };
             let mut out = relay::Limits::default();
             out.accept_conn_limit = limits.accept_conn_limit;
             out.accept_conn_burst = limits.accept_conn_burst;
             out.client_rx = client_rx;
+            out.client_rx_exempt = client_rx_exempt;
             out
         }
         None => Default::default(),

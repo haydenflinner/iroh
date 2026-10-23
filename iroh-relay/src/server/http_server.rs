@@ -6,7 +6,13 @@
 //!
 //! For a complete relay server implementation, see the parent [`server`](super) module.
 
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use derive_more::Debug;
@@ -348,6 +354,7 @@ pub(super) struct ServerBuilder {
     /// Rate-limiting is enforced on received traffic from individual clients.  This
     /// configuration applies to a single client connection.
     client_rx_ratelimit: Option<ClientRateLimit>,
+    client_rx_exempt: Vec<iroh_base::PublicKey>,
     /// The capacity of the key cache.
     key_cache_capacity: usize,
     /// Access control for endpoints.
@@ -365,6 +372,7 @@ impl ServerBuilder {
             handlers: Default::default(),
             headers: HeaderMap::new(),
             client_rx_ratelimit: None,
+            client_rx_exempt: Vec::new(),
             key_cache_capacity: DEFAULT_KEY_CACHE_CAPACITY,
             access: Arc::new(AllowAll),
             metrics: None,
@@ -408,6 +416,11 @@ impl ServerBuilder {
     ///
     /// On each client connection the incoming data is rate-limited.  By default
     /// no rate limit is enforced.
+    pub(super) fn client_rx_exempt(mut self, ids: Vec<iroh_base::PublicKey>) -> Self {
+        self.client_rx_exempt = ids;
+        self
+    }
+
     pub(super) fn client_rx_ratelimit(mut self, config: ClientRateLimit) -> Self {
         self.client_rx_ratelimit = Some(config);
         self
@@ -450,6 +463,7 @@ impl ServerBuilder {
             self.access,
             self.metrics.unwrap_or_default(),
         );
+        service.set_client_rate_limit_exempt(self.client_rx_exempt);
 
         let addr = self.addr;
         let tls_config = self.tls_config;
@@ -533,6 +547,9 @@ struct Inner {
     clients: Clients,
     write_timeout: Duration,
     rate_limit: watch::Sender<Option<ClientRateLimit>>,
+    /// Endpoint ids that read unlimited (e.g. a co-located server whose
+    /// traffic to every client funnels through one relay connection).
+    rate_limit_exempt: RwLock<HashSet<iroh_base::PublicKey>>,
     key_cache: KeyCache,
     access: Arc<dyn DynAccessControl>,
     metrics: Arc<Metrics>,
@@ -856,6 +873,7 @@ impl Inner {
         let io = RateLimited::from_watcher(io, self.rate_limit.subscribe(), self.metrics.clone())
             .map_err(|err| e!(AcceptError::RateLimitingMisconfigured, err))?;
         let limited_watcher = io.limited_watcher();
+        let exempt = io.exempt_flag();
 
         // Create a server builder with default config
         let websocket = tokio_websockets::ServerBuilder::new()
@@ -869,6 +887,16 @@ impl Inner {
         let authentication = handshake::serverside(&mut io, client_auth_header).await?;
 
         trace!(?authentication.mechanism, "accept: verified authentication");
+
+        if self
+            .rate_limit_exempt
+            .read()
+            .expect("poisoned")
+            .contains(&authentication.client_key)
+        {
+            exempt.store(true, std::sync::atomic::Ordering::Relaxed);
+            debug!(endpoint_id = %authentication.client_key.fmt_short(), "rate limit: exempt");
+        }
 
         let request =
             ClientRequest::new(authentication.client_key, protocol_version, request_parts);
@@ -927,6 +955,7 @@ impl RelayService {
             clients: Clients::default(),
             write_timeout: SERVER_WRITE_TIMEOUT,
             rate_limit: watch::Sender::new(rate_limit),
+            rate_limit_exempt: RwLock::new(HashSet::new()),
             key_cache,
             access,
             metrics,
@@ -939,6 +968,12 @@ impl RelayService {
     /// Passing `None` will remove rate limiting from all connections.
     pub fn set_client_rate_limit(&self, rate_limit: Option<ClientRateLimit>) {
         self.0.rate_limit.send_replace(rate_limit);
+    }
+
+    /// Sets the endpoint ids that are exempt from the per-client receive
+    /// rate limit. Applies to connections accepted from now on.
+    pub fn set_client_rate_limit_exempt(&self, ids: impl IntoIterator<Item = iroh_base::PublicKey>) {
+        *self.0.rate_limit_exempt.write().expect("poisoned") = ids.into_iter().collect();
     }
 
     /// Shuts down the relay service, disconnecting all clients.
